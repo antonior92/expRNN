@@ -20,19 +20,16 @@ import scipy.special
 def _onenorm_matrix_power_nnm(A, p):
     """
     Compute the 1-norm of a non-negative integer power of a non-negative matrix.
-
     Parameters
     ----------
     A : a square ndarray or matrix or sparse matrix
         Input matrix with non-negative entries.
     p : non-negative integer
         The power to which the matrix is to be raised.
-
     Returns
     -------
     out : float
         The 1-norm of the matrix power p of A.
-
     """
     # check input
     if int(p) != p or p < 0:
@@ -60,16 +57,13 @@ def _ident_like(A):
 class _ExpmPadeHelper(object):
     """
     Help lazily evaluate a matrix exponential.
-
     The idea is to not do more work than we need for high expm precision,
     so we lazily compute matrix powers and store or precompute
     other properties of the matrix.
-
     """
     def __init__(self, A):
         """
         Initialize the object.
-
         Parameters
         ----------
         A : a dense or sparse square numpy matrix or ndarray
@@ -186,33 +180,27 @@ class _ExpmPadeHelper(object):
         return U, V
 
 
-def expm32(A):
+def expm(A):
     """
     Compute the matrix exponential using Pade approximation.
-
     Parameters
     ----------
     A : (M,M) array_like or sparse matrix
         2D Array or Matrix (sparse or dense) to be exponentiated
-
     Returns
     -------
     expA : (M,M) ndarray
         Matrix exponential of `A`
-
     Notes
     -----
     This is algorithm (6.1) which is a simplification of algorithm (5.1).
-
     .. versionadded:: 0.12.0
-
     References
     ----------
     .. [1] Awad H. Al-Mohy and Nicholas J. Higham (2009)
            "A New Scaling and Squaring Algorithm for the Matrix Exponential."
            SIAM Journal on Matrix Analysis and Applications.
            31 (3). pp. 970-989. ISSN 1095-7162
-
     """
     return _expm(A)
 
@@ -265,19 +253,16 @@ def _solve_P_Q(U, V):
 def _ell(A, m):
     """
     A helper function for expm_2009.
-
     Parameters
     ----------
     A : linear operator
         A linear operator whose norm of power we care about.
     m : int
         The power of the linear operator
-
     Returns
     -------
     value : int
         A value related to a bound.
-
     """
     if len(A.shape) != 2 or A.shape[0] != A.shape[1]:
         raise ValueError('expected A to be like a square matrix')
@@ -303,11 +288,10 @@ def _ell(A, m):
     alpha = A_abs_onenorm / (_onenorm(A) * abs_c_recip)
     return max(int(np.ceil(np.log2(alpha/u) / (2 * m))), 0)
 
-def differential(f, A, E):
-    """ Computes the differential of f at A when acting on E:  (df)_A(E) """
+def expm_frechet(A, E):
     n = A.size(0)
     M = torch.zeros(2*n, 2*n, dtype=A.dtype, device=A.device, requires_grad=False)
     M[:n, :n] = A
     M[n:, n:] = A
     M[:n, n:] = E
-    return f(M)[:n, n:]
+    return expm(M)[:n, n:]

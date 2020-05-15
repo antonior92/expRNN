@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import gc
 
 
 def get_parameters(model):
@@ -8,29 +9,51 @@ def get_parameters(model):
     def get_parametrized_params(mod):
         nonlocal parametrized_params
         if isinstance(mod, Parametrization):
-            parametrized_params.append(mod.A)
+            parametrized_params.append(mod._A)
 
     def not_in(elem, l):
         return all(elem is not x for x in l)
 
     model.apply(get_parametrized_params)
-    unconstrained_params = (param for param in model.parameters() if not_in(param, parametrized_params))
-    return unconstrained_params, parametrized_params
+    normal_params = (param for param in model.parameters() if not_in(param, parametrized_params))
+    return normal_params, parametrized_params
+
+
+def parametrization_trick(model, loss):
+    """ Monkey patching """
+    backward = loss.backward
+    def new_backward(*args, **kwargs):
+        kwargs["retain_graph"] = True
+        backward(*args, **kwargs)
+
+        # Apply the backwards function to every Parametrized layer after applying loss.backward()
+        def _backwards_param(mod):
+            if isinstance(mod, Parametrization):
+                mod.backwards_param()
+        model.apply(_backwards_param)
+    loss.backward = new_backward
+    return loss
 
 
 class Parametrization(nn.Module):
     """
     Implements the parametrization of a manifold in terms of a Euclidean space
-
-    It gives the parametrized matrix through the attribute `B`
-
-    To use it, subclass it and implement the method `retraction` and the method `forward` (and optionally `project`). See the documentation in these methods for details
-
+    To use it, subclass it implement the method "retraction" (and optionally "project") when subclassing it.
     You can find an example in the file `orthogonal.py` where we implement the Orthogonal class to optimize over the Stiefel manifold using an arbitrary retraction
+    def retraction(self, raw_A, base):
+        # raw_A: Square matrix of dimensions max(input_size, output_size) x max(input_size, output_size)
+        # base: Matrix of dimensions output_size x input_size
+        # It returns the retraction that we are using
+        # It usually involves projection raw_A into the tangent space at base, and then computing the retraction
+        # When dealing with Lie groups, raw_A is always projected into the Lie algebra, as an optimization.
+    def project(self, base):
+        # This method is OPTIONAL
+        # base: Matrix of dimensions output_size x input_size
+        # It returns the projected base back into the manifold
     """
-
-    def __init__(self, A, base, mode):
+    def __init__(self, input_size, output_size, initializer, mode):
         """
+        initializer: (Tensor) -> Tensor. Initializes inplace the given tensor. It also returns it. Compatible with the initializers in torch.nn.init
         mode: "static" or a tuple such that:
                 mode[0] == "dynamic"
                 mode[1]: int, K, the number of steps after which we should change the basis of the dyn triv
@@ -39,11 +62,16 @@ class Parametrization(nn.Module):
         super(Parametrization, self).__init__()
         assert mode == "static" or (isinstance(mode, tuple) and len(mode) == 3 and mode[0] == "dynamic")
 
-        self.A = nn.Parameter(A)
-        self.register_buffer("_B", None)
-        self.register_buffer('base', base)
-        # This is necessary, as it will be generated again the first time that self.B is called
-        # We still need to register the buffer though
+        self.input_size = input_size
+        self.output_size = output_size
+        self.max_size = max(self.input_size, self.output_size)
+        self._A = nn.Parameter(torch.empty(self.max_size, self.max_size))
+        self.register_buffer("_B", torch.empty(self.input_size, self.output_size, requires_grad=True))
+        self.register_buffer('base', torch.eye(self.max_size))
+        self.initializer = initializer
+
+        self.B_updated = False
+        self.graph_computed = False
 
         if mode == "static":
             self.mode = mode
@@ -54,72 +82,70 @@ class Parametrization(nn.Module):
             self.k = 0
             self.m = 0
 
-        # This implements the parametrization trick in a rather slick way.
-        # We put a hook on A, such that, whenever its gradients are computed, we
-        #  get rid of self._B so that it has to be recomputed the next time that
-        #  self.B is accessed
-        def hook(grad):
-            nonlocal self
-            self._B = None
-        self.A.register_hook(hook)
+        self.first_base_update = self.mode == "static"
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.initializer(self._A)
 
 
     def rebase(self):
         with torch.no_grad():
-            self.base.data.copy_(self._B.data)
-            self.A.data.zero_()
+            self.base = self.retraction(self._A, self.base).data
+            self._A.data.zero_()
 
-    @property
     def B(self):
-        not_B = self._B is None
-        if not_B or (not self._B.grad_fn and torch.is_grad_enabled()):
-            self._B = self.retraction(self.A, self.base)
-            # Just to be safe
-            self._B.requires_grad_()
-            # Now self._B it's not a leaf tensor, so we convert it into a leaf
-            self._B.retain_grad()
+        """
+        Forward part of the paramtrization trick
+        """
 
-            # Increment the counters for the dyntriv algorithm if we have generated B
-            if self.mode == "dynamic" and not_B:
-                if self.k == 0:
-                    self.rebase()
-                    # Project the base back to the manifold every M changes of base
-                    # Increment the counter before as we don't project the first time
-                    self.m = (self.m + 1) % self.M
-                    # It's optional to implement this method
-                    if self.m == 0 and hasattr(self, "project"):
-                        with torch.no_grad():
-                            self.base = self.project(self.base)
-                # Change the basis after K optimization steps
-                # Increment the counter afterwards as we change the basis in the first iteration
+        # The first time we enter B, if it's a dynamic parametrization, we update the base
+        # This line is the difference between static and dynamic with K = infty
+        if not self.first_base_update and  self.mode == "dynamic":
+            self.rebase()
+            self.first_base_update = True
+
+        # We compute the parametrization once per iteration, i.e., if:
+            # We haven't updated it yet (the B_updated is a "dirty" flag)
+            # We have computed it, but it was during test time (within a with torch.no_grad() clause)
+                # In this case, we recompute it to have the graph of its derivative
+        if not self.B_updated or (torch.is_grad_enabled() and not self.graph_computed):
+            # Clean gradients from last iteration, as the variable is not managed by an optimizer
+            # This is necessary because we are using retain_graph in the backwards function for efficiency
+            if self._B.grad is not None:
+                # Free the computation graph.
+                del self._B
+                # Calling the gc manually is necessary here to clean the graph.
+                gc.collect()
+            # Compute the parametrization B on the manifold and its derivative graph
+            self._B = self.retraction(self._A, self.base)
+            # We increment the dynamic trivialization counter whenever we compute B for the first time
+            # after a gradient update, this is, whenever self.B_updated == False
+            if self.mode == "dynamic" and not self.B_updated:
                 if self.K != "infty":
+                    # Change the basis after K optimization steps
                     self.k = (self.k + 1) % self.K
-                else:
-                    # Make sure that we just update the base once
                     if self.k == 0:
-                        self.k = 1
+                        self.rebase()
+                        # Project the basis back to the manifold every M changes of basis
+                        self.m = (self.m + 1) % self.M
+                        if self.m == 0:
+                            # It's optional to implement this method
+                            if hasattr(self, "project"):
+                                with torch.no_grad():
+                                    self.base.copy_(self.project(self.base))
+            # Now it's not a leaf tensor, but we convert it into a leaf
+            self._B.retain_grad()
+            # Update the "clean" flags
+            self.B_updated = True
+            self.graph_computed = torch.is_grad_enabled()
 
         return self._B
 
-    def retraction(self, A, base):
-        """
-        It computes r_{base}(A).
-        Notice that A will not always be in the tangent space of our manifold
-          For this reason, we first have to use A to parametrize the tangent space,
-          and then compute the retraction
-        When dealing with Lie groups, raw_A is always projected into the Lie algebra, as an optimization (cf. Section E in the paper)
-        """
-        raise NotImplementedError
-
-    def project(self, base):
-        """
-        This method is OPTIONAL
-        It returns the projected base back into the manifold
-        """
-        raise NotImplementedError
+    def backwards_param(self):
+        """ Computes the gradients with respect to the parametrization """
+        self._A.grad = torch.autograd.grad([self._B], self._A, grad_outputs=(self._B.grad,))[0]
+        self.B_updated=False
 
     def forward(self, input):
-        """
-        It uses the attribute self.B to implement the layer itself (e.g. Linear, CNN, ...)
-        """
-        raise NotImplementedError
+        return input.matmul(self.B())

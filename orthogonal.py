@@ -1,42 +1,27 @@
 import torch
 import torch.nn as nn
 
-from parametrization import Parametrization
+from .parametrization import Parametrization
+from .trivializations import cayley_map, expm_skew
+from .initialization import henaff_init_, cayley_init_
 
 
 class Orthogonal(Parametrization):
     """ Class that implements optimization restricted to the Stiefel manifold """
-    def __init__(self, input_size, output_size, initializer_skew, mode, param):
+    def __init__(self, input_size, output_size, initializer, mode, param):
         """
         mode: "static" or a tuple such that:
                 mode[0] == "dynamic"
                 mode[1]: int, K, the number of steps after which we should change the basis of the dyn triv
                 mode[2]: int, M, the number of changes of basis after which we should project back onto the manifold the basis. This is particularly helpful for small values of K.
-
         param: A parametrization of in terms of skew-symmetyric matrices
         """
-        max_size = max(input_size, output_size)
-        A = torch.empty(max_size, max_size)
-        base = torch.empty(max_size, max_size)
-        super(Orthogonal, self).__init__(A, base, mode)
-        self.input_size = input_size
-        self.output_size = output_size
+        super(Orthogonal, self).__init__(input_size, output_size, initializer, mode)
         self.param = param
-        self.init_A = initializer_skew
-        self.init_base = nn.init.eye_
 
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.init_A(self.A)
-        self.init_base(self.base)
-
-    def forward(self, input):
-        return input.matmul(self.B)
-
-    def retraction(self, A, base):
+    def retraction(self, A_raw, base):
         # This could be any parametrization of a tangent space
-        A = A.triu(diagonal=1)
+        A = A_raw.triu(diagonal=1)
         A = A - A.t()
         B = base.mm(self.param(A))
         if self.input_size != self.output_size:
@@ -50,13 +35,7 @@ class Orthogonal(Parametrization):
             return U.mm(V.t())
         except RuntimeError:
             # If the svd does not converge, fallback to the (thin) QR decomposition
-            x = base
-            if base.size(0) < base.size(1):
-                x = base.t()
-            ret = torch.qr(x, some=True).Q
-            if base.size(0) < base.size(1):
-                ret = ret.t()
-            return ret
+            return torch.qr(base, some=True)[0]
 
 
 class modrelu(nn.Module):
@@ -79,12 +58,12 @@ class modrelu(nn.Module):
         return phase * magnitude
 
 
-class OrthogonalRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, initializer_skew, mode, param):
-        super(OrthogonalRNN, self).__init__()
+class OrthogonalRNNCell(nn.Module):
+    def __init__(self, input_size, hidden_size, skew_initializer, mode, param):
+        super(OrthogonalRNNCell, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.recurrent_kernel = Orthogonal(hidden_size, hidden_size, initializer_skew, mode, param=param)
+        self.recurrent_kernel = Orthogonal(hidden_size, hidden_size, skew_initializer, mode, param=param)
         self.input_kernel = nn.Linear(in_features=self.input_size, out_features=self.hidden_size, bias=False)
         self.nonlinearity = modrelu(hidden_size)
 
@@ -103,3 +82,39 @@ class OrthogonalRNN(nn.Module):
         out = self.nonlinearity(out)
 
         return out, out
+
+
+class OrthogonalRNN(nn.Module):
+    def __init__(self, input_size, hidden_size, K, init, rnn_type):
+        super(OrthogonalRNN, self).__init__()
+        if K != "infty":
+            K = int(K)
+        # Define init
+        if init == 'henaff':
+            init_ = henaff_init_
+        elif init == 'cayley':
+            init_ = cayley_init_
+        else:
+            raise ValueError("init should be in {'henaff', 'cayley'}")
+        # Define mode and param
+        if rnn_type == "exprnn":
+            mode = "static"
+            param = expm_skew
+        elif rnn_type == "dtriv":
+            # We use 100 as the default to project back to the manifold.
+            # This parameter does not really affect the convergence of the algorithms, even for K=1
+            mode = ("dynamic", K, 100)
+            param = expm_skew
+        elif rnn_type == "cayley":
+            mode = "static"
+            param = cayley_map
+        else:
+            raise ValueError("Unknown rnn_type")
+        self.rnn_cell = OrthogonalRNNCell(input_size, hidden_size, skew_initializer=init_, mode=mode, param=param)
+
+    def forward(self, inputs, state):
+        outputs = []
+        for input in torch.unbind(inputs, dim=0):
+            out_rnn, state = self.rnn_cell(input, state)
+            outputs.append(out_rnn)
+        return torch.stack(outputs, dim=0), state
